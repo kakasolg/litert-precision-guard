@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "litert-precision-guard"
+version = "0.1.0"
+description = "Automated CLI diagnostic tool to detect silent zero-vectors, NaN poisoning, and precision degradation across LiteRT hardware delegates."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "LiteRT Precision Guard Contributors" }
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "ai-edge-litert>=1.0.0",
+    "numpy>=1.22.0",
+]
+
+[project.scripts]
+litert-precision-guard = "litert_precision_guard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["litert_precision_guard*"]

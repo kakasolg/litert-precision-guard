@@ -1,0 +1,218 @@
+# LiteRT Precision Guard
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://www.python.org/)
+
+An automated diagnostic CLI tool to detect **silent numerical failures** (zero vectors, NaN/Inf poisoning, and precision underflow) when running quantized models across LiteRT hardware delegates.
+
+---
+
+## The Problem: The Silent Failure Gap
+
+This tool is **not** about "how to run LLMs on mobile devices"—ecosystems like Apple's [MLX](https://github.com/ml-explore/mlx-swift-examples) already run open models on Apple Silicon and iOS natively and effectively.
+
+Instead, the problem space is specific and critical:
+
+> **When deploying vendor-distributed, pre-quantized model files (`.tflite`) across multiple hardware backends (CPU vs. GPU delegates), there is currently no automated way to verify whether a specific delegate backend produces silently corrupted outputs without raising an explicit runtime error.**
+
+In production edge deployments, quantized models running on GPU delegates (Metal, OpenCL, WebGPU) frequently suffer from **silent shader underflow**:
+- The model initializes successfully without errors.
+- Inference returns exit code `0` and non-empty output tensors.
+- **The output values are silently all zeros (`[0.0, 0.0, ...]`), corrupted with `NaN`s, or completely degraded in semantic representation.**
+
+### Public Precedents & Cross-Platform Empirical Evidence
+
+This failure pattern has now been confirmed across **at least four independent environments and GPU architectures** (spanning Apple Metal, WebGPU, and physical Android devices from multiple GPU vendors), all sharing the same root cause and resolved by the same FP32 precision enforcement across three separate language bindings (Python `enforce_f32`, iOS Swift `kLiteRtDelegatePrecisionFp32`, and Android Kotlin `CompiledModel.GpuOptions.precision`):
+
+1. **[google-ai-edge/LiteRT#7693](https://github.com/google-ai-edge/LiteRT/issues/7693)** (macOS / Metal): Quantized `EmbeddingGemma` with default GPU delegate precision outputs silent zero vectors on Metal backends, whereas enforcing FP32 precision (`enforce_f32=True`) restores correct embeddings.
+2. **[huggingface/transformers.js#1728](https://github.com/huggingface/transformers.js/issues/1728)** (WebGPU / ONNX): WebGPU shader precision underflow on embedding/transformer layers silently collapses vector magnitudes, requiring explicit 32-bit floating point enforcement.
+3. **Android Physical Device Empirical Validation** *(confirmed independently via the public Android LiteRT Kotlin/Java API `com.google.ai.edge.litert`, outside this tool's Python scope)*:
+   Testing pre-quantized `EmbeddingGemma` across different physical mobile SoC architectures demonstrated that two distinct GPU vendors exhibited two distinct failure modes under default precision—both completely resolved by forcing FP32 (`Precision.FP32`):
+
+   | Hardware / SoC Class | GPU Architecture | Default Precision Symptom | FP32 Enforced Result | Latency Impact (vs. CPU) |
+   | :--- | :--- | :--- | :--- | :--- |
+   | Tensor G5-based device | PowerVR | **Output norm `0.0000`** (Silent zero vector) | Norm `1.0000`, Cosine `0.999100` (Healthy) | **0.56x** *(slower than CPU)* |
+   | Snapdragon 8+ Gen 1 device | Adreno 730 | **Output norm `NaN`** (Numerical instability) | Norm `1.0000`, Cosine `0.999100` (Healthy) | **1.53x** *(faster than CPU)* |
+
+   > **Note on Performance Trade-offs**: The empirical data reveals that GPU FP32 latency is **divergent across GPU vendors**. While forcing FP32 on PowerVR resulted in 0.56x speed relative to CPU, Adreno 730 achieved 1.53x speedup over CPU. Hence, "GPU FP32 is too slow" is not a universal truth, but rather hardware- and shader-unit-dependent.
+
+`litert-precision-guard` automates this verification on host/CI machines as a reproducible diagnostic tool and gatekeeper.
+
+---
+
+## How It Works
+
+```
+                        ┌───────────────────────────────┐
+                        │   Input Model (.tflite)       │
+                        └──────────────┬────────────────┘
+                                       │
+                    Generate Deterministic Inputs
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         ▼                             ▼                             ▼
+┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
+│  CPU Baseline   │           │   GPU Default   │           │ GPU FP32 Enforced│
+│   (XNNPACK)     │           │ (FP16 / Mixed)  │           │ (enforce_f32)   │
+└────────┬────────┘           └────────┬────────┘           └────────┬────────┘
+         │                             │                             │
+         │ (Ref Output)                │ (Target Output)             │ (Target Output)
+         └──────────────┬──────────────┴──────────────┬──────────────┘
+                        ▼                             ▼
+                 [Metrics Check]               [Metrics Check]
+                 - Cosine Sim vs Baseline      - Cosine Sim vs Baseline
+                 - Silent Zero Check           - Silent Zero Check
+                 - NaN / Inf Check             - NaN / Inf Check
+```
+
+1. **Deterministic Probing**: Inspects model input signatures and generates type-safe synthetic inputs (token IDs for integers, normalized distributions for floats).
+2. **Differential Comparison**: Runs the CPU reference engine (XNNPACK) to establish ground truth, then executes target delegate configurations (`gpu`, `gpu-fp32`).
+3. **Automated Anomaly Detection**:
+   - `SILENT_ZERO_VECTOR`: Flags outputs with vanishing L2 norm ($\|\mathbf{y}\| < 10^{-4}$) where CPU baseline is healthy.
+   - `NUMERICAL_INSTABILITY`: Flags `NaN` or `Inf` values.
+   - `PRECISION_DEGRADATION`: Flags cosine similarity drop below threshold (e.g. $< 0.99$).
+4. **CI/CD Exit Code**: Returns `0` if all evaluated backends pass, `1` if any silent failure is detected.
+
+---
+
+## Installation
+
+`litert-precision-guard` maintains a minimal dependency footprint (`ai-edge-litert` and `numpy`):
+
+```bash
+pip install ai-edge-litert numpy
+pip install -e .
+```
+
+---
+
+## Usage
+
+### Quick Start
+
+Run verification against CPU, default GPU delegate, and FP32-enforced GPU delegate:
+
+```bash
+litert-precision-guard path/to/model.tflite
+```
+
+### Example Output
+
+Evaluating `EmbeddingGemma-300M` (`embeddinggemma-300M_seq256_mixed-precision.tflite`):
+
+```text
+=======================================================================
+        LiteRT Delegate Precision Guard (Differential Verifier)        
+=======================================================================
+
+Model Path: embeddinggemma-300M_seq256_mixed-precision.tflite
+Signature:  embed_256
+Inputs:     {'text_batch': [1, 256]}
+Thresholds: Min Cosine Sim = 0.9900, Min Norm = 0.0001
+
+Backend                  | Status   | Cosine Sim  | Norm (Ref/Tgt)     | Max Diff   | Diagnostics
+-------------------------+----------+-------------+--------------------+------------+---------------------
+cpu                      | PASS     | 1.000000    | 1.00 / 1.00        | 0.000000   | OK (68.4 ms)
+gpu (default / FP16)     | FAIL     | 0.000000    | 1.00 / 0.00        | 0.175859   | SILENT_ZERO_VECTOR
+gpu (FP32 enforced)      | PASS     | 0.992228    | 1.00 / 1.00        | 0.015013   | OK (25.9 ms)
+
+-----------------------------------------------------------------------
+
+[DIAGNOSTIC FINDING]
+  * Detected SILENT ZERO-VECTOR / VANISHING OUTPUT on default GPU delegate.
+  * Root cause pattern: Shader precision underflow during quantized tensor computation.
+  * Known public precedent: google-ai-edge/LiteRT#7693 & huggingface/transformers.js#1728
+  * Remediation verified: Forcing FP32 on GPU delegate restored healthy cosine similarity (PASS).
+
+>>> VERIFICATION FAILED: Silent errors or precision regressions detected. <<<
+```
+
+### CLI Options
+
+| Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `model_path` | `str` | *required* | Path to `.tflite` model file |
+| `--backends` | `str` | `cpu,gpu,gpu-fp32` | Comma-separated backends to evaluate |
+| `--min-cosine-similarity` | `float` | `0.99` | Cosine similarity threshold vs CPU |
+| `--min-norm` | `float` | `1e-4` | L2 norm threshold for zero vector detection |
+| `--seed` | `int` | `42` | Random seed for deterministic inputs |
+| `--signature` | `str` | `None` | Specific signature key to execute |
+| `--json-output` | `str` | `None` | Export structured JSON report |
+| `-v`, `--verbose` | `flag` | `False` | Detailed tensor-level output |
+
+### CI / CD Integration (GitHub Actions)
+
+Use `litert-precision-guard` as a gatekeeper in your model build / release pipelines:
+
+```yaml
+name: Model Precision Verification Gate
+
+on: [push, pull_request]
+
+jobs:
+  verify-model-precision:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install ai-edge-litert numpy
+          pip install .
+          
+      - name: Run Precision Guard
+        run: |
+          # Fails pipeline if model produces silent zero-vectors or degraded embeddings
+          litert-precision-guard models/embedding.tflite \
+            --backends cpu,gpu-fp32 \
+            --min-cosine-similarity 0.99 \
+            --json-output artifacts/precision-report.json
+
+      - name: Upload Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: precision-report
+          path: artifacts/precision-report.json
+```
+
+---
+
+## Python API Usage
+
+You can also use the verifier programmatically within Python test suites:
+
+```python
+from litert_precision_guard import PrecisionVerifier
+
+verifier = PrecisionVerifier(
+    model_path="path/to/model.tflite",
+    min_cosine_similarity=0.99,
+)
+
+report = verifier.verify()
+
+if not report.all_passed:
+    for name, backend_report in report.backend_reports.items():
+        if not backend_report.passed:
+            print(f"Backend {name} failed: {backend_report.failure_reasons}")
+```
+
+---
+
+## Future Roadmap
+
+- **Multi-Runtime Extensibility**: Pluggable runner architecture for ExecuTorch (`.pte`), ONNX Runtime (CUDA / DirectML / WebGPU), and CoreML.
+- **Dynamic Layer-by-Layer Probing**: Isolate the exact operator / sub-graph where numerical precision degrades to zero.
+- **Automated Calibration Profile Suggestion**: Recommend per-operator FP32 fallback lists in `.tflite` quantization recipes.
+
+---
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for details.
