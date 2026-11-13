@@ -106,6 +106,14 @@ class LiteRTRunner:
 
         assert self._model is not None
 
+        for name, arr in inputs.items():
+            if np.asarray(arr).dtype == np.int64:
+                raise ValueError(
+                    f"Input '{name}' is int64, which the LiteRT CompiledModel Python API (TensorBuffer) does not "
+                    "accept. Re-export the model with int32 inputs, or run it with another runtime and check the "
+                    "saved outputs with --outputs/--reference."
+                )
+
         # Allocate input and output buffers
         input_buffers = self._model.create_input_buffers(self._signature_index)
         output_buffers = self._model.create_output_buffers(self._signature_index)

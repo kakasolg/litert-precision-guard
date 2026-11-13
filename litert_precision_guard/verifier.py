@@ -21,6 +21,88 @@ DEFAULT_BACKENDS = [
 ]
 
 
+def load_npz(path: str) -> Dict[str, np.ndarray]:
+    """Loads a .npz file into a {name: array} dict."""
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def _pair_outputs(
+    reference: Dict[str, np.ndarray],
+    outputs: Dict[str, np.ndarray],
+) -> List[tuple]:
+    """Pairs reference arrays with outputs by name; a single array on each side is paired regardless of name."""
+    if len(reference) == 1 and len(outputs) == 1:
+        (rn, ra), (on, oa) = next(iter(reference.items())), next(iter(outputs.items()))
+        return [(on, ra, oa)]
+    pairs = []
+    for name, ra in reference.items():
+        if name not in outputs:
+            raise ValueError(f"Reference output '{name}' not found among outputs {sorted(outputs)}")
+        pairs.append((name, ra, outputs[name]))
+    return pairs
+
+
+def compare_to_reference(
+    reference: Dict[str, np.ndarray],
+    outputs: Dict[str, np.ndarray],
+    min_cosine_similarity: float = 0.99,
+    min_norm: float = 1e-4,
+) -> List[TensorComparison]:
+    """Compares outputs against an external reference (e.g. the original model's outputs for the same inputs).
+
+    Unlike the CPU-vs-delegate comparison, this also catches a wrong CPU result, and outputs that keep a
+    normal norm but point the wrong way. Arrays with the same number of elements but a different shape are
+    reshaped to the output's shape.
+    """
+    comps = []
+    for name, ref, out in _pair_outputs(reference, outputs):
+        ref = np.asarray(ref)
+        if ref.shape != out.shape:
+            if ref.size != out.size:
+                raise ValueError(f"Reference '{name}' has shape {list(ref.shape)}, output has {list(out.shape)}")
+            ref = ref.reshape(out.shape)
+        comps.append(compute_tensor_metrics(
+            tensor_name=f"ref:{name}",
+            baseline=ref,
+            target=out,
+            min_cosine_similarity=min_cosine_similarity,
+            min_norm=min_norm,
+            mismatch_reason=FailureReason.REFERENCE_MISMATCH,
+        ))
+    return comps
+
+
+def verify_output_files(
+    reference_path: str,
+    outputs_path: str,
+    min_cosine_similarity: float = 0.99,
+    min_norm: float = 1e-4,
+) -> VerificationReport:
+    """Checks outputs produced elsewhere (a phone, Core AI, ONNX Runtime, a browser) against a reference.
+
+    Both files are .npz. No model is run.
+    """
+    comps = compare_to_reference(load_npz(reference_path), load_npz(outputs_path), min_cosine_similarity, min_norm)
+    reasons: List[FailureReason] = []
+    for c in comps:
+        for r in c.failure_reasons:
+            if r not in reasons:
+                reasons.append(r)
+    passed = all(c.passed for c in comps)
+    cfg = BackendConfig(name="outputs", accelerator="external", enforce_f32=False, description=outputs_path)
+    return VerificationReport(
+        model_path=outputs_path,
+        signature_key=None,
+        input_shapes={},
+        min_cosine_similarity=min_cosine_similarity,
+        min_norm=min_norm,
+        backend_reports={"outputs": BackendReport(config=cfg, passed=passed, tensor_comparisons=comps,
+                                                  failure_reasons=reasons)},
+        all_passed=passed,
+    )
+
+
 class PrecisionVerifier:
     """Verifies numerical precision and detects silent failures across execution backends."""
 
@@ -98,8 +180,15 @@ class PrecisionVerifier:
         custom_inputs: Optional[Dict[str, np.ndarray]] = None,
         warmup: int = 1,
         iterations: int = 1,
+        reference_outputs: Optional[Dict[str, np.ndarray]] = None,
     ) -> VerificationReport:
-        """Executes differential verification against all configured backends."""
+        """Executes differential verification against all configured backends.
+
+        With `reference_outputs` (expected outputs for `custom_inputs`, e.g. from the original framework model),
+        every backend, the CPU included, is also compared against that reference.
+        """
+        if reference_outputs is not None and custom_inputs is None:
+            raise ValueError("reference_outputs needs the matching custom_inputs")
         # 1. Initialize CPU baseline runner to probe model structure and compute reference
         cpu_runner = LiteRTRunner(
             model_path=self.model_path,
@@ -138,10 +227,16 @@ class PrecisionVerifier:
             )
             cpu_comparisons.append(comp)
 
+        if reference_outputs is not None:
+            cpu_comparisons.extend(compare_to_reference(
+                reference_outputs, baseline_outputs, self.min_cosine_similarity, self.min_norm))
+
         cpu_passed = all(c.passed for c in cpu_comparisons)
-        cpu_failures = []
+        cpu_failures: List[FailureReason] = []
         for c in cpu_comparisons:
-            cpu_failures.extend(c.failure_reasons)
+            for r in c.failure_reasons:
+                if r not in cpu_failures:
+                    cpu_failures.append(r)
 
         backend_reports["cpu"] = BackendReport(
             config=cpu_config,
@@ -197,6 +292,10 @@ class PrecisionVerifier:
                             min_norm=self.min_norm,
                         )
                     comparisons.append(comp)
+
+                if reference_outputs is not None:
+                    comparisons.extend(compare_to_reference(
+                        reference_outputs, target_outputs, self.min_cosine_similarity, self.min_norm))
 
                 target_passed = all(c.passed for c in comparisons)
                 target_failures: List[FailureReason] = []

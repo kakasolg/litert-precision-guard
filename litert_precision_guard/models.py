@@ -11,6 +11,7 @@ class FailureReason(str, Enum):
     NUMERICAL_INSTABILITY = "NUMERICAL_INSTABILITY"  # NaN or Inf
     PRECISION_DEGRADATION = "PRECISION_DEGRADATION"  # Cosine sim or error threshold exceeded
     EXECUTION_ERROR = "EXECUTION_ERROR"  # Delegate initialization or runtime crash
+    REFERENCE_MISMATCH = "REFERENCE_MISMATCH"  # Output disagrees with an external reference (e.g. the original model)
 
 
 @dataclass
@@ -42,6 +43,7 @@ class TensorComparison:
     is_zero_vector: bool
     passed: bool
     failure_reasons: List[FailureReason] = field(default_factory=list)
+    min_row_cosine: Optional[float] = None  # set for [N, D] outputs with N > 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -58,6 +60,7 @@ class TensorComparison:
             "is_zero_vector": bool(self.is_zero_vector),
             "passed": bool(self.passed),
             "failure_reasons": [r.value for r in self.failure_reasons],
+            "min_row_cosine": None if self.min_row_cosine is None else float(self.min_row_cosine),
         }
 
 

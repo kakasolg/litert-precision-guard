@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from typing import TextIO
+from typing import Optional, TextIO
 
 from litert_precision_guard.models import FailureReason, VerificationReport
 
@@ -16,8 +16,9 @@ CYAN = "\033[96m"
 GRAY = "\033[90m"
 
 
-def render_report_to_terminal(report: VerificationReport, verbose: bool = False, file: TextIO = sys.stdout) -> None:
+def render_report_to_terminal(report: VerificationReport, verbose: bool = False, file: Optional[TextIO] = None) -> None:
     """Renders a comprehensive diagnostic report to standard output."""
+    file = file or sys.stdout
     file.write(f"\n{BOLD}{CYAN}======================================================================={RESET}\n")
     file.write(f"{BOLD}{CYAN}        LiteRT Delegate Precision Guard (Differential Verifier)        {RESET}\n")
     file.write(f"{BOLD}{CYAN}======================================================================={RESET}\n\n")
@@ -61,6 +62,8 @@ def render_report_to_terminal(report: VerificationReport, verbose: bool = False,
                 status_badge = f"{RED}{BOLD}FAIL{RESET} "
 
             cos_str = f"{comp.cosine_similarity:.6f}"
+            if comp.min_row_cosine is not None and comp.min_row_cosine < comp.cosine_similarity:
+                cos_str = f"{comp.min_row_cosine:.6f}*"  # worst row of a batch
             norms_str = f"{comp.baseline_norm:.2f} / {comp.target_norm:.2f}"
             max_diff_str = f"{comp.max_abs_diff:.6f}" if comp.max_abs_diff != float("inf") else "inf"
 
@@ -82,6 +85,10 @@ def render_report_to_terminal(report: VerificationReport, verbose: bool = False,
                 file.write(
                     f"{display_name:<24} | {status_badge:<15} | {cos_str:<11} | {norms_str:<18} | {max_diff_str:<10} | {diag}\n"
                 )
+
+    if any(c.min_row_cosine is not None and c.min_row_cosine < c.cosine_similarity
+           for b in report.backend_reports.values() for c in b.tensor_comparisons):
+        file.write("\n* cosine of the worst row in a batch output\n")
 
     file.write(f"\n{BOLD}{CYAN}-----------------------------------------------------------------------{RESET}\n")
 
@@ -106,7 +113,8 @@ def render_report_to_terminal(report: VerificationReport, verbose: bool = False,
 
     file.write(f"\n")
     if report.all_passed:
-        file.write(f"{GREEN}{BOLD}>>> VERIFICATION PASSED: All target backends match CPU baseline within thresholds. <<<{RESET}\n\n")
+        what = "the reference" if "outputs" in report.backend_reports else "the CPU baseline"
+        file.write(f"{GREEN}{BOLD}>>> VERIFICATION PASSED: All outputs match {what} within thresholds. <<<{RESET}\n\n")
     else:
         file.write(f"{RED}{BOLD}>>> VERIFICATION FAILED: Silent errors or precision regressions detected. <<<{RESET}\n\n")
 

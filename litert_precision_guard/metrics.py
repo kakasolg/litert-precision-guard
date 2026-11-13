@@ -12,6 +12,7 @@ def compute_tensor_metrics(
     target: np.ndarray,
     min_cosine_similarity: float = 0.99,
     min_norm: float = 1e-4,
+    mismatch_reason: FailureReason = FailureReason.PRECISION_DEGRADATION,
 ) -> TensorComparison:
     """Compares a target tensor output against the baseline (CPU) output.
 
@@ -19,6 +20,11 @@ def compute_tensor_metrics(
     1. Silent zero-vector / vanishing output (norm is ~0 while baseline is non-zero)
     2. Numerical instability (NaN or Inf values)
     3. Precision degradation (cosine similarity below threshold or high divergence)
+
+    For a 2-D [N, D] output with N > 1 (a batch of embeddings), cosine is also computed per row and the
+    worst row must pass too, so a few wrong rows cannot hide inside a good overall cosine.
+    `mismatch_reason` is the reason recorded when cosine is too low (REFERENCE_MISMATCH when the baseline is
+    an external reference rather than the CPU run).
     """
     baseline_flat = np.asarray(baseline, dtype=np.float64).ravel()
     target_flat = np.asarray(target, dtype=np.float64).ravel()
@@ -49,6 +55,18 @@ def compute_tensor_metrics(
         # Clamp to [-1.0, 1.0] for precision float discrepancies
         cosine_sim = float(np.clip(cosine_sim, -1.0, 1.0))
 
+    min_row_cosine = None
+    b2, t2 = np.asarray(baseline, dtype=np.float64), np.asarray(target, dtype=np.float64)
+    if b2.ndim == 2 and b2.shape == t2.shape and b2.shape[0] > 1 and not (has_nan or has_inf):
+        bn = np.linalg.norm(b2, axis=1)
+        tn = np.linalg.norm(t2, axis=1)
+        ok = (bn > 1e-12) & (tn > 1e-12)
+        rows = np.zeros(b2.shape[0])
+        rows[ok] = (b2[ok] * t2[ok]).sum(1) / (bn[ok] * tn[ok])
+        min_row_cosine = float(np.clip(rows.min(), -1.0, 1.0))
+        if bool(((bn >= min_norm) & (tn < min_norm)).any()):
+            is_zero_vector = True
+
     # Differences
     if has_nan or has_inf:
         max_abs_diff = float("inf")
@@ -63,8 +81,9 @@ def compute_tensor_metrics(
         failure_reasons.append(FailureReason.NUMERICAL_INSTABILITY)
     if is_zero_vector:
         failure_reasons.append(FailureReason.SILENT_ZERO_VECTOR)
-    if not (has_nan or has_inf or is_zero_vector) and cosine_sim < min_cosine_similarity:
-        failure_reasons.append(FailureReason.PRECISION_DEGRADATION)
+    worst = cosine_sim if min_row_cosine is None else min(cosine_sim, min_row_cosine)
+    if not (has_nan or has_inf or is_zero_vector) and worst < min_cosine_similarity:
+        failure_reasons.append(mismatch_reason)
 
     passed = len(failure_reasons) == 0
 
@@ -82,4 +101,5 @@ def compute_tensor_metrics(
         is_zero_vector=is_zero_vector,
         passed=passed,
         failure_reasons=failure_reasons,
+        min_row_cosine=min_row_cosine,
     )

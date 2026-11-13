@@ -23,10 +23,10 @@ In production edge deployments, quantized models running on GPU delegates (Metal
 
 ### Public Precedents & Cross-Platform Empirical Evidence
 
-This failure pattern has now been confirmed across **at least five independent environments and GPU architectures** (spanning Apple Metal, Apple Core AI, WebGPU, and physical Android devices from multiple GPU vendors), all sharing the same root cause and resolved by the same FP32 precision enforcement across three separate language bindings (Python `enforce_f32`, iOS Swift `kLiteRtDelegatePrecisionFp32`, and Android Kotlin `CompiledModel.GpuOptions.precision`):
+This failure pattern has now been confirmed across **at least five independent environments and GPU architectures** (spanning Apple Metal, Apple Core AI, WebGPU, and physical Android devices from multiple GPU vendors), each made correct again by running at FP32 (precision enforcement in three separate language bindings (Python `enforce_f32`, iOS Swift `kLiteRtDelegatePrecisionFp32`, and Android Kotlin `CompiledModel.GpuOptions.precision`, or an fp32 model/dtype):
 
 1. **[google-ai-edge/LiteRT#7693](https://github.com/google-ai-edge/LiteRT/issues/7693)** (macOS / Metal): Quantized `EmbeddingGemma` with default GPU delegate precision outputs silent zero vectors on Metal backends, whereas enforcing FP32 precision (`enforce_f32=True`) restores correct embeddings.
-2. **[huggingface/transformers.js#1728](https://github.com/huggingface/transformers.js/issues/1728)** (WebGPU / ONNX): WebGPU shader precision underflow on embedding/transformer layers silently collapses vector magnitudes, requiring explicit 32-bit floating point enforcement.
+2. **[huggingface/transformers.js#1728](https://github.com/huggingface/transformers.js/issues/1728)** (WebGPU / ONNX): `embeddinggemma-300m-ONNX` with `q4`/`q8` on WebGPU returns embeddings with normal-looking norms that are nearly orthogonal to the correct ones (cosine ≈ 0 to WASM and to the original model), with no error; `fp32` on WebGPU is correct. Zero/NaN checks alone do not catch this — a cosine comparison against a trusted output does (see [Checking against a reference](#checking-against-a-reference)).
 3. **Android Physical Device Empirical Validation** *(confirmed independently via the public Android LiteRT Kotlin/Java API `com.google.ai.edge.litert`, outside this tool's Python scope)*:
    Testing pre-quantized `EmbeddingGemma` across different physical mobile SoC architectures demonstrated that two distinct GPU vendors exhibited two distinct failure modes under default precision—both completely resolved by forcing FP32 (`Precision.FP32`):
 
@@ -114,6 +114,42 @@ Run verification against CPU, default GPU delegate, and FP32-enforced GPU delega
 litert-precision-guard path/to/model.tflite
 ```
 
+### Checking against a reference
+
+The default run compares each GPU configuration with the CPU run. That cannot catch two cases:
+
+- **The CPU result is wrong too** (a conversion or quantization error, or a runtime path that is silently wrong
+  on every backend). Then CPU and GPU agree with each other and both are wrong.
+- **Outputs from another runtime** (a phone, ONNX Runtime, Core ML / Core AI, a browser) that this tool cannot run.
+
+For both, save expected outputs from a trusted source (for example the original PyTorch model) for a fixed set of
+real inputs, and compare against them:
+
+```bash
+# run the .tflite on real inputs; every backend, the CPU included, is also compared with the reference
+litert-precision-guard model.tflite --inputs inputs.npz --reference reference.npz
+
+# compare outputs produced elsewhere; no model is run
+litert-precision-guard --outputs device_outputs.npz --reference reference.npz --min-cosine-similarity 0.995
+```
+
+`.npz` keys are tensor names; with a single array on each side the names do not have to match. A failure here is
+reported as `REFERENCE_MISMATCH`. For a batch output of shape `[N, D]` (e.g. N embeddings), the cosine of every row is
+checked and the worst row is shown with `*`, so a few wrong rows cannot hide in a good overall cosine.
+
+Example: EmbeddingGemma-300M seq64 int8 `.tflite` (run with the classic `Interpreter`) against the original PyTorch
+model on 8 Korean/English texts:
+
+```
+Backend                  | Status | Cosine Sim  | Norm (Ref/Tgt)     | Max Diff   | Diagnostics
+external                 | PASS   | 0.997503*   | 2.83 / 2.83        | 0.008726   | OK
+* cosine of the worst row in a batch output
+```
+
+> **int64 inputs:** the LiteRT `CompiledModel` Python API (`TensorBuffer`) does not accept int64 tensors, so models
+> with int64 inputs (common for token IDs) cannot be run by this tool. Re-export with int32 inputs, or run the model
+> elsewhere and use `--outputs`.
+
 ### Example Output
 
 Evaluating `EmbeddingGemma-300M` (`embeddinggemma-300M_seq256_mixed-precision.tflite`):
@@ -155,6 +191,9 @@ gpu (FP32 enforced)      | PASS     | 0.992228    | 1.00 / 1.00        | 0.01501
 | `--min-norm` | `float` | `1e-4` | L2 norm threshold for zero vector detection |
 | `--seed` | `int` | `42` | Random seed for deterministic inputs |
 | `--signature` | `str` | `None` | Specific signature key to execute |
+| `--inputs` | `str` | `None` | `.npz` of real inputs instead of synthetic ones |
+| `--reference` | `str` | `None` | `.npz` of expected outputs for `--inputs` (or for `--outputs`) |
+| `--outputs` | `str` | `None` | `.npz` of outputs produced elsewhere; compared with `--reference`, no model is run |
 | `--json-output` | `str` | `None` | Export structured JSON report |
 | `-v`, `--verbose` | `flag` | `False` | Detailed tensor-level output |
 

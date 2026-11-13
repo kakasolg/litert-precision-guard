@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from litert_precision_guard.models import BackendConfig
 from litert_precision_guard.report import export_report_to_json, render_report_to_terminal
-from litert_precision_guard.verifier import PrecisionVerifier
+from litert_precision_guard.verifier import PrecisionVerifier, load_npz, verify_output_files
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -17,7 +17,29 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "model_path",
         type=str,
-        help="Path to the .tflite model file to verify.",
+        nargs="?",
+        default=None,
+        help="Path to the .tflite model file to verify (omit when using --outputs).",
+    )
+    parser.add_argument(
+        "--inputs",
+        type=str,
+        default=None,
+        help="Optional .npz of real model inputs (name -> array) used instead of synthetic inputs.",
+    )
+    parser.add_argument(
+        "--reference",
+        type=str,
+        default=None,
+        help="Optional .npz of expected outputs for --inputs (e.g. from the original PyTorch model). Every backend, "
+             "the CPU included, is also compared against it.",
+    )
+    parser.add_argument(
+        "--outputs",
+        type=str,
+        default=None,
+        help="Check an .npz of outputs produced elsewhere (phone, Core AI, ONNX Runtime, browser) against "
+             "--reference without running a model.",
     )
     parser.add_argument(
         "--backends",
@@ -68,6 +90,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
 
+    if args.outputs:
+        if not args.reference:
+            print("--outputs needs --reference", file=sys.stderr)
+            return 1
+        try:
+            report = verify_output_files(args.reference, args.outputs, args.min_cosine_similarity, args.min_norm)
+        except Exception as exc:
+            print(f"Comparison failed: {exc}", file=sys.stderr)
+            return 1
+        render_report_to_terminal(report, verbose=args.verbose)
+        if args.json_output:
+            export_report_to_json(report, args.json_output)
+            print(f"JSON report saved to: {args.json_output}")
+        return 0 if report.all_passed else 1
+
+    if not args.model_path:
+        print("model_path is required unless --outputs is given", file=sys.stderr)
+        return 1
+    if args.reference and not args.inputs:
+        print("--reference needs --inputs (the inputs the reference outputs were produced from)", file=sys.stderr)
+        return 1
+
     try:
         backend_configs = PrecisionVerifier.parse_backend_names(args.backends)
     except ValueError as e:
@@ -84,7 +128,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     try:
-        report = verifier.verify()
+        inputs = load_npz(args.inputs) if args.inputs else None
+        reference = load_npz(args.reference) if args.reference else None
+        report = verifier.verify(custom_inputs=inputs, reference_outputs=reference)
     except Exception as exc:
         print(f"Verification failed with runtime error: {exc}", file=sys.stderr)
         return 1

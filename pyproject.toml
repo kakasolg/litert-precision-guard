@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litert-precision-guard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automated CLI diagnostic tool to detect silent zero-vectors, NaN poisoning, and precision degradation across LiteRT hardware delegates."
 readme = "README.md"
 license = { text = "Apache-2.0" }
