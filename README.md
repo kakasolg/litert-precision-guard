@@ -23,19 +23,36 @@ In production edge deployments, quantized models running on GPU delegates (Metal
 
 ### Public Precedents & Cross-Platform Empirical Evidence
 
-This failure pattern has now been confirmed across **at least four independent environments and GPU architectures** (spanning Apple Metal, WebGPU, and physical Android devices from multiple GPU vendors), all sharing the same root cause and resolved by the same FP32 precision enforcement across three separate language bindings (Python `enforce_f32`, iOS Swift `kLiteRtDelegatePrecisionFp32`, and Android Kotlin `CompiledModel.GpuOptions.precision`):
+This failure pattern has now been confirmed across **at least five independent environments and GPU architectures** (spanning Apple Metal, Apple Core AI, WebGPU, and physical Android devices from multiple GPU vendors), all sharing the same root cause and resolved by the same FP32 precision enforcement across three separate language bindings (Python `enforce_f32`, iOS Swift `kLiteRtDelegatePrecisionFp32`, and Android Kotlin `CompiledModel.GpuOptions.precision`):
 
 1. **[google-ai-edge/LiteRT#7693](https://github.com/google-ai-edge/LiteRT/issues/7693)** (macOS / Metal): Quantized `EmbeddingGemma` with default GPU delegate precision outputs silent zero vectors on Metal backends, whereas enforcing FP32 precision (`enforce_f32=True`) restores correct embeddings.
 2. **[huggingface/transformers.js#1728](https://github.com/huggingface/transformers.js/issues/1728)** (WebGPU / ONNX): WebGPU shader precision underflow on embedding/transformer layers silently collapses vector magnitudes, requiring explicit 32-bit floating point enforcement.
 3. **Android Physical Device Empirical Validation** *(confirmed independently via the public Android LiteRT Kotlin/Java API `com.google.ai.edge.litert`, outside this tool's Python scope)*:
    Testing pre-quantized `EmbeddingGemma` across different physical mobile SoC architectures demonstrated that two distinct GPU vendors exhibited two distinct failure modes under default precision—both completely resolved by forcing FP32 (`Precision.FP32`):
 
-   | Hardware / SoC Class | GPU Architecture | Default Precision Symptom | FP32 Enforced Result | Latency Impact (vs. CPU) |
-   | :--- | :--- | :--- | :--- | :--- |
-   | Tensor G5-based device | PowerVR | **Output norm `0.0000`** (Silent zero vector) | Norm `1.0000`, Cosine `0.999100` (Healthy) | **0.56x** *(slower than CPU)* |
-   | Snapdragon 8+ Gen 1 device | Adreno 730 | **Output norm `NaN`** (Numerical instability) | Norm `1.0000`, Cosine `0.999100` (Healthy) | **1.53x** *(faster than CPU)* |
+   | Hardware / SoC Class | GPU Architecture | Default Precision Symptom | FP32 Enforced Result | GPU FP32 speed vs. single-thread CPU (`Interpreter`) | GPU FP32 speed vs. 4-thread CPU (`CompiledModel`) |
+   | :--- | :--- | :--- | :--- | :--- | :--- |
+   | Tensor G5-based device | PowerVR | **Output norm `0.0000`** (Silent zero vector) | Norm `1.0000`, Cosine `0.999100` (Healthy) | **0.56x** *(slower)* | not measured *(expected to be slower still)* |
+   | Snapdragon 8+ Gen 1 device | Adreno 730 | **Output norm `NaN`** (Numerical instability) | Norm `1.0000`, Cosine `0.9988–0.9993` (Healthy) | 1.53x *(faster)* | **0.73–0.80x** *(slower: 135 ms vs. 98–108 ms median)* |
 
-   > **Note on Performance Trade-offs**: The empirical data reveals that GPU FP32 latency is **divergent across GPU vendors**. While forcing FP32 on PowerVR resulted in 0.56x speed relative to CPU, Adreno 730 achieved 1.53x speedup over CPU. Hence, "GPU FP32 is too slow" is not a universal truth, but rather hardware- and shader-unit-dependent.
+   > **Correction (2026-11):** an earlier version of this table reported that FP32-enforced GPU on Adreno 730 was 1.53x
+   > *faster* than CPU and concluded that GPU FP32 speed is vendor-dependent. That CPU baseline was the classic
+   > `Interpreter` path, which on LiteRT 2.1.x runs XNNPACK on a single core regardless of the thread setting. Re-measured
+   > against `CompiledModel` CPU with 4 threads (bit-identical vectors), FP32 GPU is **slower on both devices we tested**.
+   > The correctness finding is unchanged: default precision silently breaks the output, FP32 fixes it.
+   >
+   > Re-checked on LiteRT **2.3.2** (`litert` + `litert-gpu`, Adreno 730, the official `seq256` mixed-precision
+   > EmbeddingGemma file): default GPU precision still returns NaN for every output value (23,040/23,040), FP32 is
+   > healthy (cosine 0.9988 to CPU) at 135 ms vs. 108 ms for 4-thread CPU.
+   >
+   > **Takeaway for deployment:** enforce FP32 if you use the GPU delegate at all, and benchmark it against a
+   > multi-threaded CPU baseline (`CompiledModel` + `CpuOptions`), not against `Interpreter`. A slow single-thread
+   > baseline can make the GPU look like a win when it is not.
+
+4. **Apple Core AI (iOS 27 / macOS 27)**: an independent Core AI export of EmbeddingGemma 300M reports the same failure
+   on Apple's newer runtime: its fp16 variants (both a full cast and mixed-precision autocast) "produce NaN embeddings
+   on-device" because Gemma 3 activations overflow half precision, so only an fp32 build is shipped
+   ([model card](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-CoreAI)). Not reproduced by us.
 
 `litert-precision-guard` automates this verification on host/CI machines as a reproducible diagnostic tool and gatekeeper.
 
