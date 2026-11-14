@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/kakasolg/litert-precision-guard/actions/workflows/test.yml/badge.svg)](https://github.com/kakasolg/litert-precision-guard/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 
 An automated diagnostic CLI tool to detect **silent numerical failures** (zero vectors, NaN/Inf poisoning, and precision underflow) when running quantized models across LiteRT hardware delegates.
 
